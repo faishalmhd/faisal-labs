@@ -1,0 +1,369 @@
+{
+  "$schema": "https://json.schemastore.org/contract",
+  "project_name": "virtual-number-store",
+  "version": "1.1.0",
+  "description": "Storefront nomor virtual OTP sekali pakai dengan pembayaran QRIS (Midtrans) dan supplier 5sim/SMS-Activate. Browser hanya berkomunikasi dengan Supabase Edge Functions; tabel transaksi tidak dapat diakses langsung dari client.",
+  "stack": {
+    "frontend": {
+      "framework": "React 18",
+      "language": "TypeScript 5.7",
+      "bundler": "Vite 6",
+      "styling": "Tailwind CSS 3.4",
+      "icons": "lucide-react",
+      "qrcode": "qrcode.react",
+      "hosting": "Vercel (SPA rewrite)"
+    },
+    "backend": {
+      "runtime": "Supabase Edge Functions (Deno)",
+      "database": "Supabase Postgres 15 + RLS",
+      "auth": "Supabase Auth (admin only)",
+      "secrets": "Supabase Edge Function secrets"
+    },
+    "third_party": {
+      "payments": "Midtrans Core API - QRIS",
+      "supplier": "5sim.net (default) / sms-activate (opsional)"
+    }
+  },
+  "modes": {
+    "demo": {
+      "trigger": "VITE_DEMO_MODE=true ATAU VITE_SUPABASE_URL/VITE_SUPABASE_ANON_KEY masih placeholder",
+      "storage": "sessionStorage",
+      "notes": [
+        "Katalog, order, pembayaran, OTP, dan admin dashboard memakai data mock lokal.",
+        "Tidak ada request jaringan ke Supabase.",
+        "Voucher demo: DEMO100 atau GRATIS menutup seluruh pembayaran.",
+        "Admin demo: login 1-klik, tanpa verifikasi kredensial."
+      ]
+    },
+    "live": {
+      "trigger": "VITE_DEMO_MODE=false/kosong DAN VITE_SUPABASE_URL + VITE_SUPABASE_ANON_KEY valid",
+      "notes": [
+        "Semua data melalui Edge Functions.",
+        "Login admin diverifikasi oleh Supabase Auth, lalu otorisasi dicek terhadap public.admin_users.",
+        "Simulasi pembayaran disembunyikan."
+      ]
+    }
+  },
+  "environment": {
+    "frontend_public": {
+      "VITE_SUPABASE_URL": "https://<project-ref>.supabase.co",
+      "VITE_SUPABASE_ANON_KEY": "<anon-public-key>",
+      "VITE_DEMO_MODE": "true | false (opsional, paksa mode demo)"
+    },
+    "edge_function_secrets": {
+      "SUPABASE_URL": "https://<project-ref>.supabase.co",
+      "SUPABASE_SERVICE_ROLE_KEY": "<service-role-key>",
+      "MIDTRANS_SERVER_KEY": "<server-key>",
+      "MIDTRANS_IS_PRODUCTION": "false | true",
+      "QRIS_EXPIRY_MINUTES": "10",
+      "APP_ORIGIN": "https://<frontend-domain>",
+      "SUPPLIER_PROVIDER": "5sim | sms-activate",
+      "SUPPLIER_API_KEY": "<supplier-api-key>",
+      "SUPPLIER_BASE_URL": "https://5sim.net/v1",
+      "SUPPLIER_CURRENCY_TO_IDR": "16000",
+      "SUPPLIER_MIN_BALANCE_IDR": "500000",
+      "SELLER_MARGIN_BPS": "2000",
+      "CATALOG_PAIRS_JSON": "[{\"serviceId\":\"telegram\",\"serviceName\":\"Telegram\",\"countryCode\":\"indonesia\",\"countryName\":\"Indonesia\"}]",
+      "SMS_ACTIVATE_API_KEY": "<optional>",
+      "SMS_ACTIVATE_CURRENCY_TO_IDR": "16000"
+    }
+  },
+  "database_schema": {
+    "public.orders": {
+      "columns": {
+        "id": "uuid PK default gen_random_uuid()",
+        "order_code": "text NOT NULL UNIQUE (format VN + 24 hex uppercase)",
+        "pin_hash": "text NOT NULL (bcrypt, cost 12)",
+        "service_id": "text NOT NULL",
+        "service_name": "text NOT NULL",
+        "country_code": "text NOT NULL",
+        "country_name": "text NOT NULL",
+        "supplier_cost_idr": "bigint NOT NULL CHECK >= 0",
+        "sell_price_idr": "bigint NOT NULL CHECK > 0",
+        "amount_due_idr": "bigint NOT NULL CHECK >= 0",
+        "voucher_applied_idr": "bigint NOT NULL default 0",
+        "voucher_restored_at": "timestamptz NULL",
+        "payment_status": "text default 'pending' CHECK (pending|paid|expired|cancelled)",
+        "fulfillment_status": "text default 'waiting_payment' CHECK (waiting_payment|processing|completed|refunded|failed)",
+        "midtrans_transaction_id": "text NULL",
+        "supplier_order_id": "bigint NULL",
+        "fulfillment_claimed_at": "timestamptz NULL",
+        "phone_number": "text NULL",
+        "otp_code": "text NULL",
+        "qris_payload": "text NULL",
+        "voucher_code": "text NULL",
+        "expires_at": "timestamptz NOT NULL",
+        "created_at": "timestamptz NOT NULL default now()",
+        "updated_at": "timestamptz NOT NULL default now()"
+      },
+      "indexes": ["order_code UNIQUE", "orders_created_at_idx (created_at DESC)", "orders_payment_status_idx (payment_status, fulfillment_status)"],
+      "rls": "ENABLED - policy deny-all untuk anon/authenticated; hanya service_role"
+    },
+    "public.financial_ledger": {
+      "columns": {
+        "id": "bigint identity PK",
+        "order_id": "uuid NOT NULL REFERENCES public.orders(id)",
+        "entry_type": "text CHECK (payment_gross|qris_mdr|supplier_cost|voucher_redeemed|voucher_issued)",
+        "amount_idr": "bigint NOT NULL",
+        "reference": "text NOT NULL",
+        "created_at": "timestamptz default now()"
+      },
+      "constraints": ["UNIQUE (order_id, entry_type, reference)", "immutable: trigger menolak UPDATE/DELETE/TRUNCATE"],
+      "rls": "ENABLED - deny-all client"
+    },
+    "public.refund_vouchers": {
+      "columns": {
+        "id": "uuid PK default gen_random_uuid()",
+        "order_id": "uuid NOT NULL UNIQUE REFERENCES public.orders(id)",
+        "voucher_code": "text NOT NULL UNIQUE",
+        "amount_idr": "bigint NOT NULL CHECK > 0",
+        "remaining_amount_idr": "bigint NOT NULL CHECK >= 0",
+        "status": "text default 'active' CHECK (active|spent|expired)",
+        "expires_at": "timestamptz default now() + interval '1 year'",
+        "created_at": "timestamptz default now()"
+      },
+      "rls": "ENABLED - deny-all client"
+    },
+    "public.webhook_logs": {
+      "columns": {
+        "id": "bigint identity PK",
+        "transaction_id": "text NOT NULL",
+        "transaction_status": "text NOT NULL",
+        "order_code": "text NOT NULL",
+        "gross_amount": "text NOT NULL",
+        "created_at": "timestamptz default now()"
+      },
+      "constraints": ["UNIQUE (transaction_id, transaction_status)"],
+      "rls": "ENABLED - deny-all client"
+    },
+    "public.rate_limits": {
+      "columns": {
+        "key_hash": "text PK (HMAC-SHA256 IP)",
+        "window_started_at": "timestamptz NOT NULL",
+        "request_count": "integer NOT NULL CHECK >= 0"
+      },
+      "rules": "Maksimal 5 request QRIS per 1 menit per IP.",
+      "rls": "ENABLED - deny-all client"
+    },
+    "public.admin_users": {
+      "columns": {
+        "user_id": "uuid PK REFERENCES auth.users(id) ON DELETE CASCADE",
+        "created_at": "timestamptz default now()"
+      },
+      "rls": "ENABLED - deny-all client"
+    },
+    "rpc_functions": {
+      "allow_qris_request(p_ip_hash text)": "boolean - rate limit per IP",
+      "create_secure_order(...)": "jsonb - buat order + hash PIN + redeem voucher",
+      "get_order_secure(p_order_code text, p_pin_hash text)": "jsonb - baca order aman dengan PIN",
+      "save_qris_payload(p_order_code text, p_qris_payload text, p_transaction_id text)": "boolean",
+      "process_midtrans_event(...)": "jsonb - verifikasi amount, idempotensi webhook, ledgers",
+      "save_supplier_purchase(p_order_code text, p_supplier_order_id bigint, p_phone_number text)": "boolean",
+      "claim_supplier_fulfillment(p_order_code text)": "boolean - klaim fulfillment atomik",
+      "save_order_otp(p_order_code text, p_otp_code text)": "boolean",
+      "issue_refund_voucher(p_order_code text, p_voucher_code text)": "jsonb",
+      "cancel_pending_order(p_order_code text)": "jsonb",
+      "is_admin(p_user_id uuid)": "boolean",
+      "get_admin_financial_summary()": "jsonb"
+    }
+  },
+  "endpoints": [
+    {
+      "name": "get-catalog",
+      "method": "GET",
+      "path": "/functions/v1/get-catalog",
+      "auth": "anon (Supabase client invoke)",
+      "request": null,
+      "response_200": {
+        "offers": [
+          {
+            "serviceId": "telegram",
+            "serviceName": "Telegram",
+            "countryCode": "indonesia",
+            "countryName": "Indonesia",
+            "stock": 45,
+            "sellPriceIdr": 3500
+          }
+        ]
+      },
+      "errors": {
+        "405": { "error": "Metode permintaan tidak didukung." },
+        "503": { "error": "Katalog belum dapat dimuat. Silakan coba beberapa saat lagi." }
+      }
+    },
+    {
+      "name": "create-qris-order",
+      "method": "POST",
+      "path": "/functions/v1/create-qris-order",
+      "auth": "anon (Supabase client invoke)",
+      "request": {
+        "serviceId": "telegram",
+        "countryCode": "indonesia",
+        "pin": "123456",
+        "voucherCode": "OPTIONAL-CODE"
+      },
+      "response_201": {
+        "orderCode": "VN0123456789ABCDEF01234567",
+        "pin": "123456",
+        "amount": 3500,
+        "originalAmount": 3500,
+        "voucherApplied": 0,
+        "qrisPayload": "00020101021226...",
+        "expiresAt": "2026-11-25T10:10:00.000Z",
+        "paymentStatus": "pending"
+      },
+      "response_201_voucher_full": {
+        "orderCode": "VN0123456789ABCDEF01234567",
+        "pin": "123456",
+        "amount": 0,
+        "qrisPayload": null,
+        "paymentStatus": "paid",
+        "fulfillmentStatus": "refunded",
+        "voucherCode": "ABCDEF0123456789ABCDEF0123456789",
+        "message": "Stok nomor habis. Saldo telah dikembalikan dalam bentuk voucher refund baru."
+      },
+      "errors": {
+        "400": { "error": "Data pesanan tidak valid. | Layanan atau negara tidak tersedia. | Voucher tidak valid atau telah kedaluwarsa." },
+        "409": { "error": "Stok nomor untuk pilihan ini sedang habis." },
+        "429": { "error": "Terlalu banyak permintaan. Silakan coba kembali satu menit lagi." },
+        "503": { "error": "Pesanan belum dapat dibuat. Silakan coba kembali." }
+      }
+    },
+    {
+      "name": "sync-otp",
+      "method": "POST",
+      "path": "/functions/v1/sync-otp",
+      "auth": "anon (Supabase client invoke)",
+      "request": { "orderCode": "VN0123456789ABCDEF01234567", "pin": "123456" },
+      "response_200": {
+        "order": {
+          "order_code": "VN0123456789ABCDEF01234567",
+          "service_name": "Telegram",
+          "country_name": "Indonesia",
+          "sell_price_idr": 3500,
+          "amount_due_idr": 3500,
+          "payment_status": "paid",
+          "fulfillment_status": "completed",
+          "phone_number": "+6281234567890",
+          "otp_code": "849-203",
+          "qris_payload": "00020101021226...",
+          "voucher_code": null,
+          "voucher_amount_idr": null,
+          "expires_at": "2026-11-25T10:10:00.000Z",
+          "supplier_order_id": 512345,
+          "service_id": "telegram",
+          "country_code": "indonesia",
+          "midtrans_transaction_id": "uuid"
+        }
+      },
+      "errors": {
+        "400": { "error": "Kode pesanan atau PIN tidak valid." },
+        "404": { "error": "Pesanan tidak ditemukan. Periksa kembali kode dan PIN." },
+        "503": { "error": "Status pesanan belum dapat diperbarui." }
+      }
+    },
+    {
+      "name": "cancel-order",
+      "method": "POST",
+      "path": "/functions/v1/cancel-order",
+      "auth": "anon (Supabase client invoke)",
+      "request": { "orderCode": "VN0123456789ABCDEF01234567", "pin": "123456" },
+      "response_200": { "cancelled": true },
+      "errors": {
+        "400": { "error": "Kode pesanan atau PIN tidak valid." },
+        "404": { "error": "Pesanan tidak ditemukan." },
+        "409": { "error": "Hanya pesanan yang belum dibayar yang dapat dibatalkan. | Status pesanan telah berubah." },
+        "503": { "error": "Pesanan belum dapat dibatalkan." }
+      }
+    },
+    {
+      "name": "admin-api",
+      "method": "GET",
+      "path": "/functions/v1/admin-api?limit=50",
+      "auth": "Bearer JWT user yang terdaftar di public.admin_users",
+      "request": null,
+      "response_200": {
+        "orders": [
+          {
+            "order_code": "VN0123456789ABCDEF01234567",
+            "service_name": "Telegram",
+            "country_name": "Indonesia",
+            "sell_price_idr": 3500,
+            "amount_due_idr": 3500,
+            "payment_status": "paid",
+            "fulfillment_status": "completed",
+            "fulfillment_claimed_at": "2026-11-25T09:05:00.000Z",
+            "phone_number": "+6281234567890",
+            "otp_code": "849-203",
+            "created_at": "2026-11-25T09:00:00.000Z"
+          }
+        ],
+        "summary": {
+          "gross_payments_idr": 35000,
+          "qris_mdr_idr": 245,
+          "supplier_cost_idr": 20000,
+          "net_profit_idr": 14755
+        }
+      },
+      "errors": {
+        "401": { "error": "Sesi admin tidak valid. | Akses admin ditolak." },
+        "503": { "error": "Data pesanan tidak dapat dimuat." }
+      }
+    },
+    {
+      "name": "admin-api-cancel",
+      "method": "POST",
+      "path": "/functions/v1/admin-api",
+      "auth": "Bearer JWT admin",
+      "request": { "action": "cancel", "orderCode": "VN0123456789ABCDEF01234567" },
+      "response_200": { "cancelled": true },
+      "errors": {
+        "400": { "error": "Kode pesanan tidak valid. | Aksi admin tidak dikenal." },
+        "409": { "error": "Pesanan tidak dapat dibatalkan." }
+      }
+    },
+    {
+      "name": "admin-api-issue-voucher",
+      "method": "POST",
+      "path": "/functions/v1/admin-api",
+      "auth": "Bearer JWT admin",
+      "request": { "action": "issue-voucher", "orderCode": "VN0123456789ABCDEF01234567" },
+      "response_200": { "issued": true },
+      "errors": {
+        "409": { "error": "Pesanan belum memenuhi syarat rekonsiliasi voucher." }
+      }
+    },
+    {
+      "name": "midtrans-webhook",
+      "method": "POST",
+      "path": "/functions/v1/midtrans-webhook",
+      "auth": "tanpa JWT (verify_jwt = false), signature SHA-512 Midtrans diverifikasi di fungsi",
+      "request": {
+        "transaction_id": "uuid",
+        "transaction_status": "settlement | expire | deny | cancel | pending",
+        "status_code": "200",
+        "order_id": "VN0123456789ABCDEF01234567",
+        "gross_amount": "3500.00",
+        "signature_key": "sha512(transaction_id+status_code+gross_amount+server_key)"
+      },
+      "response_200": { "ok": true },
+      "errors": {
+        "401": { "error": "Signature tidak valid." },
+        "404": { "error": "Pesanan tidak ditemukan." }
+      }
+    }
+  ],
+  "frontend_routes": {
+    "/": "StorefrontPage - pilih layanan, PIN, buat order, bayar QRIS",
+    "/#admin": "AdminDashboardPage - login Supabase Auth, tabel order, ringkasan keuangan, cancel & voucher"
+  },
+  "security_rules": [
+    "Tidak ada secret server di variabel VITE_*.",
+    "Semua tabel transaksi memakai RLS deny-all untuk anon/authenticated.",
+    "PIN disimpan sebagai bcrypt hash dan diverifikasi di database.",
+    "Webhook Midtrans idempoten (unique transaction_id + transaction_status) dan memvalidasi nominal.",
+    "Rate limit 5 request QRIS/menit/IP menggunakan HMAC hash + advisory lock.",
+    "Fulfillment supplier memakai klaim atomik untuk mencegah pembelian ganda.",
+    "CSP ketat di vercel.json; hanya koneksi ke *.supabase.co dan Midtrans."
+  ]
+}
